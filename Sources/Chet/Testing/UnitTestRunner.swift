@@ -112,6 +112,7 @@ enum UnitTestRunner {
         failures += runPopulationTests()
         failures += runPopulationPathTests()
         failures += runCachePrefixTests()
+        failures += runCacheReloadTests()
 
         check(
             "launch.unitTestsSkipAutoScan",
@@ -1236,5 +1237,245 @@ enum UnitTestRunner {
         }
 
         return failures
+    }
+
+    /// Directory upserts must keep the row id, every merged directory must be written,
+    /// and a volume-root scan must match descendants of `/`.
+    private static func runCacheReloadTests() -> Int {
+        final class ResultBox: @unchecked Sendable {
+            var failures = 0
+            var done = false
+        }
+        let box = ResultBox()
+
+        Task { @MainActor in
+            func check(_ name: String, _ condition: Bool) {
+                if condition {
+                    print("PASS \(name)")
+                } else {
+                    print("FAIL \(name)")
+                    box.failures += 1
+                }
+            }
+
+            func find(_ name: String, in node: FileNode) -> FileNode? {
+                if node.name == name { return node }
+                for child in node.children {
+                    if let found = find(name, in: child) { return found }
+                }
+                return nil
+            }
+
+            func directory(path: String, name: String, size: Int64) -> FileNode {
+                let node = FileNode(
+                    url: URL(fileURLWithPath: path, isDirectory: true),
+                    name: name,
+                    isDirectory: true,
+                    category: .other
+                )
+                node.size = size
+                return node
+            }
+
+            func file(path: String, name: String, size: Int64) -> FileNode {
+                let node = FileNode(
+                    url: URL(fileURLWithPath: path),
+                    name: name,
+                    isDirectory: false,
+                    category: .documents
+                )
+                node.size = size
+                node.fileCount = 1
+                return node
+            }
+
+            let cache = ScanCache.shared
+            guard cache.open() else {
+                check("cache.reload.open", false)
+                box.done = true
+                return
+            }
+
+            let token = UUID().uuidString
+            let base = (NSTemporaryDirectory() as NSString).appendingPathComponent("chet-cache-reload-\(token)")
+            let parentPath = (base as NSString).appendingPathComponent("parent")
+            let childPath = (parentPath as NSString).appendingPathComponent("kept.txt")
+            let projPath = (base as NSString).appendingPathComponent("proj")
+            let readmePath = (projPath as NSString).appendingPathComponent("README")
+            let srcPath = (projPath as NSString).appendingPathComponent("src")
+            let mainPath = (srcPath as NSString).appendingPathComponent("main.swift")
+            let batchPath = (base as NSString).appendingPathComponent("batch")
+            let dirAPath = (batchPath as NSString).appendingPathComponent("dirA")
+            let dirBPath = (batchPath as NSString).appendingPathComponent("dirB")
+            defer {
+                for path in [parentPath, projPath, batchPath] {
+                    cache.removeCachedScan(rootPath: path)
+                }
+            }
+
+            let parent = directory(path: parentPath, name: "parent", size: 40)
+            let kept = file(path: childPath, name: "kept.txt", size: 40)
+            kept.parent = parent
+            parent.children = [kept]
+            parent.fileCount = 1
+            cache.saveTree(parent, rootPath: parentPath, eventID: 1)
+            parent.size = 80
+            var parentWork = DiffCacheWork()
+            parentWork.recordUpsertDirectory(parent, parentPath: nil)
+            parentWork.persist()
+            if let (reloadedParent, _) = cache.loadTree(for: parentPath, maxDepth: 4) {
+                let keptNode = find("kept.txt", in: reloadedParent)
+                check("cache.reload.parentIsRoot", reloadedParent.name == "parent")
+                check("cache.reload.childStaysUnderParent", keptNode?.parent?.name == "parent")
+            } else {
+                check("cache.reload.parentIsRoot", false)
+                check("cache.reload.childStaysUnderParent", false)
+            }
+
+            let project = directory(path: projPath, name: "proj", size: 150)
+            let readme = file(path: readmePath, name: "README", size: 100)
+            let src = directory(path: srcPath, name: "src", size: 50)
+            let mainFile = file(path: mainPath, name: "main.swift", size: 50)
+            readme.parent = project
+            src.parent = project
+            mainFile.parent = src
+            src.children = [mainFile]
+            src.fileCount = 1
+            project.children = [readme, src]
+            project.fileCount = 2
+            cache.saveTree(project, rootPath: projPath, eventID: 1)
+
+            readme.size = 400
+            let state = ScanState()
+            state.installTestTree(project)
+            await state.applyPopulationDiff(
+                forTesting: project,
+                newChildren: [readme, src],
+                rootPath: projPath
+            )
+            if let (reloadedProj, _) = cache.loadTree(for: projPath, maxDepth: 6) {
+                let readmeNode = find("README", in: reloadedProj)
+                let srcNode = find("src", in: reloadedProj)
+                let mainNode = find("main.swift", in: reloadedProj)
+                check("cache.reload.projRoot", reloadedProj.name == "proj")
+                check("cache.reload.readmeStays", readmeNode?.parent?.name == "proj")
+                check("cache.reload.srcStays", srcNode?.parent?.name == "proj")
+                check("cache.reload.grandchildStays", mainNode?.parent?.name == "src")
+            } else {
+                check("cache.reload.projRoot", false)
+                check("cache.reload.readmeStays", false)
+                check("cache.reload.srcStays", false)
+                check("cache.reload.grandchildStays", false)
+            }
+
+            let batchRoot = directory(path: batchPath, name: "batch", size: 30)
+            let dirA = directory(path: dirAPath, name: "dirA", size: 10)
+            let dirB = directory(path: dirBPath, name: "dirB", size: 20)
+            let markerA = file(path: (dirAPath as NSString).appendingPathComponent("a.txt"), name: "a.txt", size: 10)
+            let markerB = file(path: (dirBPath as NSString).appendingPathComponent("b.txt"), name: "b.txt", size: 20)
+            markerA.parent = dirA
+            markerB.parent = dirB
+            dirA.children = [markerA]
+            dirB.children = [markerB]
+            dirA.fileCount = 1
+            dirB.fileCount = 1
+            dirA.parent = batchRoot
+            dirB.parent = batchRoot
+            batchRoot.children = [dirA, dirB]
+            batchRoot.fileCount = 2
+            cache.saveTree(batchRoot, rootPath: batchPath, eventID: 1)
+
+            dirA.size = 111
+            dirB.size = 222
+            let batchRootPath = batchRoot.url.path(percentEncoded: false)
+            var workA = DiffCacheWork()
+            workA.recordUpsertDirectory(dirA, parentPath: batchRootPath)
+            var workB = DiffCacheWork()
+            workB.recordUpsertDirectory(dirB, parentPath: batchRootPath)
+            var merged = DiffCacheWork()
+            merged.merge(workA)
+            merged.merge(workB)
+            merged.persist()
+            if let (reloadedBatch, _) = cache.loadTree(for: batchPath, maxDepth: 4) {
+                let loadedA = find("dirA", in: reloadedBatch)
+                let loadedB = find("dirB", in: reloadedBatch)
+                check("cache.reload.mergeDirA", loadedA?.size == 111 && loadedA?.parent?.name == "batch")
+                check("cache.reload.mergeDirB", loadedB?.size == 222 && loadedB?.parent?.name == "batch")
+                check("cache.reload.mergeChildA", find("a.txt", in: reloadedBatch)?.parent?.name == "dirA")
+                check("cache.reload.mergeChildB", find("b.txt", in: reloadedBatch)?.parent?.name == "dirB")
+            } else {
+                check("cache.reload.mergeDirA", false)
+                check("cache.reload.mergeDirB", false)
+                check("cache.reload.mergeChildA", false)
+                check("cache.reload.mergeChildB", false)
+            }
+
+            let volumeDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("chet-volume-cache-\(token)", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: volumeDir, withIntermediateDirectories: true)
+                let volumeCache = ScanCache(databaseFileURL: volumeDir.appendingPathComponent("scans.db"))
+                if volumeCache.open() {
+                    let volume = directory(path: "/", name: "/", size: 70)
+                    let users = directory(path: "/Users", name: "Users", size: 70)
+                    let probe = file(path: "/Users/chet-volume-probe", name: "chet-volume-probe", size: 70)
+                    probe.parent = users
+                    users.children = [probe]
+                    users.fileCount = 1
+                    users.parent = volume
+                    volume.children = [users]
+                    volume.fileCount = 1
+                    volumeCache.saveTree(volume, rootPath: "/", eventID: 1)
+                    if let (loadedVolume, _) = volumeCache.loadTree(for: "/", maxDepth: 4) {
+                        check("cache.root.loadRoot", loadedVolume.url.path(percentEncoded: false) == "/")
+                        check(
+                            "cache.root.loadChild",
+                            find("chet-volume-probe", in: loadedVolume)?.parent?.name == "Users"
+                        )
+                    } else {
+                        check("cache.root.loadRoot", false)
+                        check("cache.root.loadChild", false)
+                    }
+
+                    volumeCache.deleteSubtree(path: "/")
+                    let replacement = directory(path: "/", name: "/", size: 9)
+                    let second = file(path: "/Users/chet-volume-second", name: "chet-volume-second", size: 9)
+                    second.parent = replacement
+                    replacement.children = [second]
+                    replacement.fileCount = 1
+                    volumeCache.saveTree(replacement, rootPath: "/", eventID: 2)
+                    if let (afterDelete, _) = volumeCache.loadTree(for: "/", maxDepth: 4) {
+                        let names = find("chet-volume-probe", in: afterDelete)
+                        check("cache.root.deleteDropsOldChild", names == nil)
+                        check(
+                            "cache.root.deleteKeepsNewChild",
+                            find("chet-volume-second", in: afterDelete)?.parent?.url.path(percentEncoded: false) == "/"
+                        )
+                    } else {
+                        check("cache.root.deleteDropsOldChild", false)
+                        check("cache.root.deleteKeepsNewChild", false)
+                    }
+                } else {
+                    check("cache.root.open", false)
+                }
+                volumeCache.close()
+                try? FileManager.default.removeItem(at: volumeDir)
+            } catch {
+                check("cache.root.setup", false)
+                try? FileManager.default.removeItem(at: volumeDir)
+            }
+
+            box.done = true
+        }
+
+        let deadline = Date(timeIntervalSinceNow: 8)
+        while !box.done && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+        }
+        if !box.done {
+            print("FAIL cache.reload.timeout")
+            box.failures += 1
+        }
+        return box.failures
     }
 }

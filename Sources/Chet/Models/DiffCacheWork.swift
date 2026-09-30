@@ -2,7 +2,7 @@ import Foundation
 
 /// Cache mutations collected on the main actor and applied on a background thread.
 struct DiffCacheWork: @unchecked Sendable {
-    var upsertDirNode: (node: FileNode, parentPath: String?)?
+    private(set) var upsertDirectories: [(node: FileNode, parentPath: String?)] = []
 
     private(set) var deleteNodes: [String] = []
     private(set) var deleteSubtrees: [String] = []
@@ -17,6 +17,10 @@ struct DiffCacheWork: @unchecked Sendable {
         deleteSubtrees.append(path)
     }
 
+    mutating func recordUpsertDirectory(_ node: FileNode, parentPath: String?) {
+        upsertDirectories.append((node, parentPath))
+    }
+
     mutating func recordUpsertNode(_ node: FileNode, parentPath: String) {
         upsertNodes.append((node, parentPath))
     }
@@ -26,9 +30,7 @@ struct DiffCacheWork: @unchecked Sendable {
     }
 
     mutating func merge(_ other: DiffCacheWork) {
-        if let upsert = other.upsertDirNode {
-            upsertDirNode = upsert
-        }
+        upsertDirectories.append(contentsOf: other.upsertDirectories)
         deleteNodes.append(contentsOf: other.deleteNodes)
         deleteSubtrees.append(contentsOf: other.deleteSubtrees)
         upsertNodes.append(contentsOf: other.upsertNodes)
@@ -38,7 +40,7 @@ struct DiffCacheWork: @unchecked Sendable {
     func persist() {
         let cache = ScanCache.shared
         _ = cache.open()
-        if let upsert = upsertDirNode {
+        for upsert in upsertDirectories {
             cache.upsertNode(upsert.node, parentPath: upsert.parentPath)
         }
         for path in deleteSubtrees {

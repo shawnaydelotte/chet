@@ -356,7 +356,7 @@ final class ScanState {
         let newByName = Dictionary(uniqueKeysWithValues: newChildren.map { ($0.name, $0) })
         let parentPath = dirNode.url.path(percentEncoded: false)
         let grandparentPath = dirNode.parent?.url.path(percentEncoded: false)
-        cacheWork.upsertDirNode = (dirNode, grandparentPath)
+        cacheWork.recordUpsertDirectory(dirNode, parentPath: grandparentPath)
 
         var sizeDelta: Int64 = 0
         var logicalDelta: Int64 = 0

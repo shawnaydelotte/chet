@@ -5,21 +5,27 @@ import SQLite3
 /// Uses raw libsqlite3 C API — ships with macOS, zero dependencies.
 final class ScanCache: @unchecked Sendable {
     private var db: OpaquePointer?
+    private let databaseFileURL: URL
 
-    static let shared = ScanCache()
+    static let shared: ScanCache = ScanCache(databaseFileURL: ScanCache.defaultDatabaseURL)
 
-    private static var dbURL: URL {
+    private static var defaultDatabaseURL: URL {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
         let dir = caches.appendingPathComponent("com.chet.diskanalyzer", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("scans.db")
     }
 
+    /// `databaseFileURL` lets checks open a private database. The shared cache stays on the user cache.
+    init(databaseFileURL: URL) {
+        self.databaseFileURL = databaseFileURL
+    }
+
     // MARK: - Open / Close
 
     func open() -> Bool {
         if db != nil { return true }
-        let path = Self.dbURL.path(percentEncoded: false)
+        let path = databaseFileURL.path(percentEncoded: false)
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
             return false
         }
@@ -387,11 +393,26 @@ final class ScanCache: @unchecked Sendable {
 
         let nodePath = node.url.path(percentEncoded: false)
         let depth = node.depth
+        // UPDATE in place. INSERT OR REPLACE would delete the row, mint a new id, and
+        // leave children pointing at the old parent_id.
         let sql = """
-            INSERT OR REPLACE INTO nodes
+            INSERT INTO nodes
             (parent_id, path, name, is_directory, category, size, logical_size,
              file_count, directory_count, creation_date, modification_date, inode, depth)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                parent_id = excluded.parent_id,
+                name = excluded.name,
+                is_directory = excluded.is_directory,
+                category = excluded.category,
+                size = excluded.size,
+                logical_size = excluded.logical_size,
+                file_count = excluded.file_count,
+                directory_count = excluded.directory_count,
+                creation_date = excluded.creation_date,
+                modification_date = excluded.modification_date,
+                inode = excluded.inode,
+                depth = excluded.depth
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -443,6 +464,7 @@ final class ScanCache: @unchecked Sendable {
     /// Descendants only (`path/...`), with `%`, `_`, and `\` escaped so sibling
     /// prefixes such as `/tmp/foo` vs `/tmp/foobar` or `a_b` vs `axb` do not match.
     static func descendantLikePattern(for path: String) -> String {
+        if path == "/" { return "/%" }
         var escaped = String()
         escaped.reserveCapacity(path.count + 2)
         let specials: Set<Character> = ["\\", "%", "_"]
